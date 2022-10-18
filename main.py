@@ -151,7 +151,7 @@ def get_args_parser():
     parser.add_argument('--nb_classes', default=1000, type=int,
                         help='number of the classification types')
     parser.add_argument('--imagenet_default_mean_and_std', type=str2bool, default=True)
-    parser.add_argument('--data_set', default='IMNET', choices=['CIFAR', 'IMNET', 'image_folder'],
+    parser.add_argument('--data_set', default='IMNET', choices=['CIFAR', 'IMNET', 'image_folder', 'wds'],
                         type=str, help='ImageNet dataset path')
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -163,6 +163,10 @@ def get_args_parser():
 
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
+
+    parser.add_argument('--fields', default="image,class.cls")
+    parser.add_argument('--rename', default="image.jpg;image.png")
+
     parser.add_argument('--auto_resume', type=str2bool, default=True)
     parser.add_argument('--save_ckpt', type=str2bool, default=True)
     parser.add_argument('--save_ckpt_freq', default=1, type=int)
@@ -179,6 +183,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', type=str2bool, default=True,
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--num_samples_per_epoch', default=0, type=int)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -198,8 +203,26 @@ def get_args_parser():
                         help="The name of the W&B project where you're sending the new run.")
     parser.add_argument('--wandb_ckpt', type=str2bool, default=False,
                         help="Save model checkpoints as W&B Artifacts.")
+    parser.add_argument('--resampled', type=str2bool, default=False)
 
     return parser
+
+class DataLoaderWithLen:
+    
+
+    def __init__(self, dataloader, datainfo, nb_batches):
+        self.dataloader = dataloader
+        self.nb_batches = nb_batches
+        self.datainfo = datainfo
+
+    def __iter__(self):
+        yield from self.dataloader
+
+    def __len__(self):
+        return self.nb_batches
+    
+    def set_epoch(self, epoch):
+        self.datainfo.set_epoch(epoch)
 
 def main(args):
     utils.init_distributed_mode(args)
@@ -211,8 +234,10 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
+    
+    if args.data_set != "wds":
+        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
 
-    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     if args.disable_eval:
         args.dist_eval = False
         dataset_val = None
@@ -222,10 +247,11 @@ def main(args):
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=args.seed,
-    )
-    print("Sampler_train = %s" % str(sampler_train))
+    if args.data_set != "wds":
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=args.seed,
+        )
+        print("Sampler_train = %s" % str(sampler_train))
     if args.dist_eval:
         if len(dataset_val) % num_tasks != 0:
             print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
@@ -246,14 +272,36 @@ def main(args):
         wandb_logger = utils.WandbLogger(args)
     else:
         wandb_logger = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+    
+    if args.data_set != "wds":
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
+        nb_train = len(dataset_train)
+    else:
+        import wds
+        from datasets import build_transform
+        class wds_args:
+            distributed = args.distributed
+            batch_size = args.batch_size
+            train_data = args.data_path
+            workers = args.num_workers
+            world_size = utils.get_world_size()
+            rank = utils.get_rank()
+            train_num_samples = args.num_samples_per_epoch
+            resampled = args.resampled
+            seed = args.seed
+            rename = args.rename
+            fields = args.fields.split(",")
+        args.num_batches = args.num_samples_per_epoch // (args.batch_size * wds_args.world_size)
+        transform = build_transform(True, args)
+        data_info = wds.get_wds_dataset(wds_args, transform, True)
+        nb_train = args.num_samples_per_epoch
+        data_loader_train = DataLoaderWithLen(data_info.dataloader, data_info, data_info.dataloader.num_batches)
 
     if dataset_val is not None:
         data_loader_val = torch.utils.data.DataLoader(
@@ -325,11 +373,11 @@ def main(args):
     print('number of params:', n_parameters)
 
     total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    num_training_steps_per_epoch = nb_train // total_batch_size
     print("LR = %.8f" % args.lr)
     print("Batch size = %d" % total_batch_size)
     print("Update frequent = %d" % args.update_freq)
-    print("Number of training examples = %d" % len(dataset_train))
+    print("Number of training examples = %d" % nb_train)
     print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
     if args.layer_decay < 1.0 or args.layer_decay > 1.0:
@@ -393,12 +441,14 @@ def main(args):
     print("Start training for %d epochs" % args.epochs)
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if args.distributed and args.data_set != "wds":
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         if wandb_logger:
             wandb_logger.set_steps()
+        if hasattr(data_loader_train, "set_epoch"):
+            data_loader_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,

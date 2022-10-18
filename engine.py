@@ -30,9 +30,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # print(samples.shape, targets.shape)
         step = data_iter_step // update_freq
+        # print(step, num_training_steps_per_epoch)
         if step >= num_training_steps_per_epoch:
-            continue
+            break
         it = start_steps + step  # global training iteration
         # Update LR & WD for the first acc
         if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
